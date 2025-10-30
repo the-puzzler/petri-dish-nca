@@ -10,6 +10,32 @@ from einops import einsum, rearrange, reduce, repeat
 from config import Config
 
 
+class Skipper(nn.Module):
+    """Skip connection module for CA models.
+
+    This module implements a skip connection that adds the input
+    directly to the output, facilitating gradient flow and preserving
+    information across layers.
+    """
+
+    def __init__(self, body) -> None:
+        """Initialize the Skipper module."""
+
+        super().__init__()
+        self.body = body
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the Skipper.
+
+        Args:
+            x: Input tensor.
+
+        Returns:
+            Output tensor after applying skip connection.
+        """
+        return x + self.body(x)
+
+
 class MergedCAModel(nn.Module):
     """Merged Cellular Automata model for multiple competing NCAs.
 
@@ -33,8 +59,6 @@ class MergedCAModel(nn.Module):
             n_ncas: Number of competing NCAs.
             input_dim: Dimension of input cell state.
             hidden_dim: Hidden dimension for internal processing.
-
-        TODO: Double check that all my grouping is correct
         """
         super().__init__()
         self.N = n_ncas
@@ -72,24 +96,25 @@ class MergedCAModel(nn.Module):
             Updated tensor of same shape as input.
 
         Note:
-            TODO: Maybe want to change this to only update the areas where it is alive.
         """
         x = self.encode(x)
         x = self.reasoning(x)
         return self.compression(x)
 
     def mid_conv_block(self):
-        return nn.Sequential(
-            nn.Conv2d(
-                self.N * self.HD,
-                self.N * self.HD,
-                self.KS,
-                padding=(self.KS - 1) // 2,
-                groups=self.N,
-                bias=False,
-            ),
-            nn.GELU(),
-            nn.Dropout(p=self.DC),
+        return Skipper(
+            nn.Sequential(
+                nn.Conv2d(
+                    self.N * self.HD,
+                    self.N * self.HD,
+                    self.KS,
+                    padding=(self.KS - 1) // 2,
+                    groups=self.N,
+                    bias=False,
+                ),
+                nn.GELU(),
+                nn.Dropout(p=self.DC),
+            )
         )
 
 
@@ -187,6 +212,7 @@ class CASunGroup:
         self.alive_visible = config.alive_visible
         self.cell_state_dim = config.cell_state_dim
         self.cell_hidden_dim = config.cell_hidden_dim
+        self.softmax_temp = config.softmax_temp
 
         # Make list of proposed upates and then iterate through to find total strengths
         # This is marking what you are fighting, sunshine is idx 0
@@ -220,7 +246,6 @@ class CASunGroup:
 
         # Initialize N NCAs
         self.models = CAEntity(config)
-        self.alpha = config.world_blend_alpha
 
         # NOTE: Maybe try something with softmax temp rather than this aliveness threshold
         self.threshold = torch.tensor(0.4, device=config.device)
@@ -245,7 +270,6 @@ class CASunGroup:
         Args:
             config: Configuration object.
         """
-        # TODO: This should be adaptable based on the args
         sun_vec = torch.randn(self.out_dim, device=config.device)
 
         sun_vec[self.hidden_idxs - self.N] = 0.0
@@ -277,10 +301,6 @@ class CASunGroup:
         if not self.alive_visible:
             x_flat = x_flat[:, self.cell_idxs]
 
-        # NOTE: Okay, let's keep track of it all. N is for each perspective, where M is for NCA i's update in that perspective (plus sun)
-        # SUPER BIG NOTE: This is just temporary to see how it does
-        # Okay, so this is kind of different now since I need to like add so that sun now also has it's own perspective.
-        # TODO: There might be some smarter way to do this?
         hids_visible_to_each = int(self.per_hid_upd * self.cell_hidden_dim)
         xs = torch.arange(self.n_ncas, device=self.device)
         offsets = torch.arange(hids_visible_to_each, device=self.device)
@@ -312,11 +332,14 @@ class CASunGroup:
         all_updates = all_updates * self.perspective_mask + all_updates.detach() * (
             1 - self.perspective_mask
         )
-        # sun_update = self.sun_update.expand(self.n_ncas, 1, B, self.out_dim, H, W)
-        # all_updates = torch.cat([sun_update, all_updates], dim=1)  # [N, M, B, OC, H, W]
 
         x_new = self._run_competition_parallel(x_perspectives, all_updates)
+
+        # NOTE: Different ways of keeping the grid bounded
+        # NOTE: :100 was for making sure torch.quantile doesn't break
         x_new = x_new.clamp(-1, 1)
+        # x_new = torch.nn.functional.tanh(x_new/torch.quantile(x_new[0,0,:,:100,:100].abs(), 0.9).detach())
+
         return x_new
 
     def _run_competition_parallel(
@@ -334,7 +357,6 @@ class CASunGroup:
         """
         N, B, C, H, W = x_perspectives.shape
 
-        # TODO: Go through and check all this
         # Since all perspectives are the same, can you just get it for one and that's good enough?
         alive_mask_flat = self._get_nca_alive_mask(x_perspectives[0])  # [M, B, H, W]
         alive_mask = repeat(alive_mask_flat, "m b h w -> n m b h w", n=N)
@@ -344,8 +366,6 @@ class CASunGroup:
         all_attacks = all_updates[:, :, :, self.att_idxs]  # [N, M, B, C_att, H, W]
         all_defenses = all_updates[:, :, :, self.def_idxs]  # [N, M, B, C_def, H, W]
 
-        # TODO: Limit the # of interactions
-        # touches = torch.any((alive_mask[self.interactions[:, 0]] & alive_mask[self.interactions[:, 1]]).view(self.N * (self.N-1), -1), dim=1)
         att_alive = alive_mask_flat[self.interactions[:, 0]]
         def_alive = alive_mask_flat[self.interactions[:, 1]]
         alive_together = att_alive & def_alive
@@ -355,10 +375,13 @@ class CASunGroup:
         att_idx = self.interactions[touching_ncas, 0]
         def_idx = self.interactions[touching_ncas, 1]
 
-        attacks = all_attacks[:, att_idx]  # [N, I, B, C_att, H, W]
-        defenses = all_defenses[:, def_idx]  # [N, I, B, C_def, H, W]
-
-        cos_sim = F.cosine_similarity(attacks, defenses, dim=3)  # [N, I, B, H, W]
+        # cos_sim = F.cosine_similarity(attacks, defenses, dim=3)  # [N, I, B, H, W]
+        cos_sim = F.cosine_similarity(
+            all_attacks[:, att_idx], all_defenses[:, def_idx], dim=3
+        )  # [N, I, B, H, W]
+        defense_cos_sim = F.cosine_similarity(
+            all_attacks[:, def_idx], all_defenses[:, att_idx], dim=3
+        )  # [N, I, B, H, W]
 
         if self.mode == "eval":
             cos_sim_reduced = reduce(cos_sim.detach(), "n i b h w -> i", "mean")
@@ -369,26 +392,20 @@ class CASunGroup:
 
         strengths = einsum(
             cos_sim, self.str_add_idx[touching_ncas], "n i b h w, i m -> n m b h w"
-        )  # [N, M, B, H, W]
+        ) - einsum(
+            defense_cos_sim,
+            self.str_add_idx[touching_ncas],
+            "n i b h w, i m -> n m b h w",
+        )
 
         # Apply alive mask to this!
         strengths = strengths.masked_fill(~alive_mask, -torch.inf)
         strengths = strengths.softmax(dim=1)
 
-        # AH OKAY, here is the major change!
-        # So you can't just add, since you need to expand.... or like you're like y'know,
-        # blending now? For now, just test seeing what happens
-        # strengths [N, M, B, H, W] where M=N+1
-        # NOTE: Alive channels is M
-        # Right, the problem is that it's only adding the last channels, but I also need the first ones too
-
         x_new = torch.zeros_like(x_perspectives)
         x_new[:, :, self.cell_idxs] = x_perspectives[:, :, self.cell_idxs] + einsum(
             all_updates, strengths, "n m b c h w, n m b h w -> n b c h w"
         )
-        # x_new[:, :, self.cell_idxs] = (1-self.alpha) * x_perspectives[:, :, self.cell_idxs] + self.alpha * einsum(
-        #     all_updates, strengths, "n m b c h w, n m b h w -> n b c h w"
-        # )
 
         x_new[:, :, self.ali_idxs] = rearrange(strengths, "n m b h w -> n b m h w").to(
             x_new.dtype
@@ -401,10 +418,9 @@ class CASunGroup:
         )
 
         x_new[:, :, self.ali_idxs] = torch.softmax(
-            x_new[:, :, self.ali_idxs], dim=2
+            x_new[:, :, self.ali_idxs] / self.softmax_temp, dim=2
         ).to(x_new.dtype)
 
-        # NOTE: Wait down here it's to n b m h w, but up there it's n m b h w
         alive_mask_flat = self._get_nca_alive_mask(x_new[0])  # [M, B, H, W]
         alive_mask = repeat(alive_mask_flat, "m b h w -> n b m h w", n=N)
 
@@ -440,10 +456,6 @@ class CASunGroup:
         for s in range(steps):
             x_perspectives = self._parallel_forward_step(x_perspectives)
             all_xs[s].copy_(x_perspectives[0].detach())
-
-        # TODO: Do this in a more serious manner
-        # with torch.no_grad():
-        #     final_x = x_perspectives[0].detach().clone()
 
         return x_perspectives, all_xs, self.inter
 
@@ -484,7 +496,7 @@ class CASunGroup:
         gradients, and updates model parameters.
 
         Args:
-            x_perspectives: Perspective grids [N, B, C, H, W].
+            x_perspectives: Perspective grids [N, B, C, H, W]. (includes sun perspective)
 
         Returns:
             Dictionary containing training statistics:
@@ -492,26 +504,50 @@ class CASunGroup:
             - grad_norms: List of gradient norms for monitoring
         """
 
-        N, B, _, _, _ = x_perspectives.shape
+        M, B, C, H, W = x_perspectives.shape
+        N = M - 1  # Number of NCAs (excluding sun)
 
+        m_idxs = torch.arange(M, device=self.device)
         n_idxs = torch.arange(N, device=self.device)
         # alivenesses = x_perspectives[n_idxs, :, n_idxs + 1]  # [N, B, H, W]
 
         # NOTE: This is changed now since we have the sun as a learnable param as well
-        alivenesses = x_perspectives[n_idxs, :, n_idxs]  # [N, B, H, W]
+        # alivenesses = x_perspectives[n_idxs+1, :, n_idxs+1]  # [N, B, H, W]
+        # alivenesses = x_perspectives[n_idxs, :, n_idxs]  # [N, B, H, W]
+        alivenesses = x_perspectives[m_idxs, :, m_idxs]  # [M, B, H, W]
 
-        # Hypercycle
+        # ----------- Hypercycle -------------
+        # nca_alivenesses = alivenesses[1:] # [N, B, H, W]
+        # next_nca_aliveness = torch.roll(nca_alivenesses, shifts=-1, dims=0)  # [N, B, H, W]
+
+        # x_flat = x_perspectives[n_idxs].view(N * B, C, H, W)
+        # alive_mask = self._get_nca_alive_mask(x_flat)  # [M, N*B, H, W]
+        # alive_mask = alive_mask.view(M, N, B, H, W) # [M, N, B, H, W]
+        # nca_alive_masks = alive_mask[n_idxs + 1, n_idxs] # [N, B, H, W]
+
+        # hypercycle_factor = 1.0
+        # hypercycle_bonus = torch.where(
+        #     nca_alive_masks,
+        #     next_nca_aliveness,
+        #     torch.zeros_like(next_nca_aliveness)
+        # )
+
+        # nca_alivenesses = nca_alivenesses + hypercycle_factor * hypercycle_bonus
+
+        # alivenesses = torch.cat([alivenesses[:1], nca_alivenesses], dim=0)  # [M, B, H, W]
         # alivenesses = alivenesses + torch.where(x_perspectives[n_idxs, :, n_idxs + 1] > 0,
         #     x_perspectives[n_idxs, :, ((n_idxs + 1) % self.n_ncas) + 1],  # [N, B, H, W]
         #     0
         # )
+        # ------------------------------------
 
         # Go down into batch
-        batch_alive = alivenesses.view(N, B, -1).sum(-1)  # [N, B]
+        batch_alive = alivenesses.view(M, B, -1).sum(-1)  # [N, B]
 
-        log_growth = torch.log(batch_alive + 1e-3).mean(1)  # [N]
+        log_growth = torch.asinh(batch_alive + 1e-3).mean(1)  # [N]
+        ind_losses = -log_growth
 
-        loss = (-log_growth).sum()
+        loss = ind_losses.sum()
         loss.backward()
 
         grad_norm = torch.nn.utils.get_total_norm(self.models.model.parameters())
@@ -521,13 +557,14 @@ class CASunGroup:
         self._update_sun(update_sun)
 
         # Average it out over the batch
-        single_alive = x_perspectives[n_idxs, :, n_idxs].view(N, B, -1).sum(-1)
-        percent_covered = single_alive.mean(-1) / self.total_grid_size  # [N]
+        single_alive = x_perspectives[m_idxs, :, m_idxs].view(M, B, -1).sum(-1)
+        percent_covered = single_alive.mean(-1) / self.total_grid_size  # [M]
         percent_covered = percent_covered * 100.0
 
         # sun_growth = 100.0 - sum(percent_covered)
         return {
             "loss": loss.detach().item(),
+            "ind_loss": ind_losses.tolist(),
             # "growth": [sun_growth] + percent_covered.tolist(),
             "growth": percent_covered.tolist(),
             "grad_norm": grad_norm,
@@ -544,7 +581,6 @@ class CASunGroup:
             Creates directory structure: models/{run_name}/
             Saves: config.json, sun.npy, model.pt
         """
-        # TODO: MOVE LOC OUT TO SOME ARGS OR SOMETHING
         os.mkdir(f"{run_name}")
 
         config.save(f"{run_name}/config.json")
@@ -578,8 +614,7 @@ class CASunGroup:
         before_values = first_param.data.clone()[:5]  # First 5 values
 
         # This is so that when the model is loaded during eval, it isn't compiled (getting weird issues)
-        # TODO: Should look at this more so that you can compile during "eval" too since it is actually just the same
-        # state_dict = torch.load(f"{loc}/{i}.pt", weights_only=True)
+        # NOTE: Should look at this more so that you can compile during "eval" too since it is actually just the same
         checkpoint = torch.load(f"{loc}/model.pt")
         if any(
             key.startswith("_orig_mod.")

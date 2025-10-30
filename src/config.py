@@ -23,7 +23,6 @@ class Config:
     cell_hidden_dim: int = 4
 
     # New world paradigm
-    world_blend_alpha: float = 0.9
     seed_dist: Literal["scatter"] = "scatter"
     # Whether it's set to 1 in everything or random noise
     seed_mode: Literal["solid", "random"] = "random"
@@ -46,20 +45,21 @@ class Config:
     per_hid_upd: float = 1.0  # Percentage of hidden channels each model can update
 
     # Training
+    softmax_temp: float = 1.0
     optimizer: Literal["AdamW", "Adam", "RMSProp", "SGD"] = "RMSProp"
-    learning_rate: float = 1e-4
-    batch_size: int = 64
-    pool_size: int = 2048
-    epochs: int = 10_000
+    learning_rate: float = 3e-4
+    batch_size: int = 32
+    pool_size: int = 1024
+    epochs: int = 1_000
     log_every: int = 100
     wandb: bool = False
 
     # Sun
-    sun_update_epoch_wait: int = 2
+    sun_update_epoch_wait: int = 0
 
     # Multi-world
     steps_before_update: int = 0
-    steps_per_update: int = 2
+    steps_per_update: int = 1
 
     # General system
     device: Literal["cpu", "cuda", "mps"] = "cuda"
@@ -80,6 +80,7 @@ class Config:
         assert self.n_seeds * self.n_ncas <= self.total_grid_size, (
             "[config] n_seeds * n_ncas > self.total_grid_size"
         )
+        assert self.softmax_temp > 0, "[config] softmax_temp <= 0"
 
         # Device availability check
         if self.device == "cuda" and not torch.cuda.is_available():
@@ -171,5 +172,10 @@ class Config:
         Raises:
             IOError: If the file cannot be written.
         """
+        for key, value in self.__dict__.items():
+            if isinstance(value, torch.Tensor):
+                print(f"Found tensor in {key}: {value}")
+            elif isinstance(value, torch.device):
+                print(f"Found torch.device in {key}: {value}")
         with open(path, "w") as f:
             json.dump(self.__dict__, f, indent=4)

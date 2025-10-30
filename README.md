@@ -16,7 +16,8 @@ uv sync
 
 - basic: `uv run python src/train.py --n-ncas 3 --epochs 1000 --device cpu`
 - wandb logging: `uv run python src/train.py --n-ncas 3 --epochs 10000 --device cuda --wandb`
+- run with config: `uv run python src/train.py --config configs/example.json`
 
 ## Configs
 
-For additional configurations, you can load a JSON config file.
+For additional configurations, you can load a JSON config file. Any parameters not specified in the config file will be set their default value in `src/config.py`

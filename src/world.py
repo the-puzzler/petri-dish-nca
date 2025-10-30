@@ -132,6 +132,7 @@ class World:
             "steps_per_update": config.steps_per_update,
             "update_sun": False,
             "pool_idxs": [],
+            "mode": config.mode,
         }
 
         self._init_pool(config)
@@ -184,11 +185,11 @@ class World:
         self.steps_taken += epoch_steps
 
         return self._get_stats_and_new_grid(
-            group, grid_batch, grid, grid_storage, forward_stats
+            group, grid_batch, grid, grid_storage.detach(), forward_stats
         )
 
     def save(self, config: Config, run_name: str) -> None:
-        np.save(f"{run_name}/seed.npy", self.seed_update.detach().cpu().numpy())
+        np.save(f"{run_name}/seed.npy", self.seed_update.float().detach().cpu().numpy())
 
     def load(self, loc: str) -> bool:
         """Load previous parameters for the World.
@@ -307,7 +308,7 @@ class World:
         forward_stats: dict[str, Any],
     ):
         stats = {}
-        if self.state["steps_per_update"] > 0:
+        if self.state["mode"] != "frozen_eval" and self.state["steps_per_update"] > 0:
             stats = group.update_models(grid_batch, self.state["update_sun"])
         stats["forward"] = forward_stats
 
