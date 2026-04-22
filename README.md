@@ -1,6 +1,8 @@
 # Petri Dish NCA
 
-What happens if we are able to put multiple different NCAs in a single substrate that compete for space?
+This repo now contains a first-pass implementation of the `new.md` proposal:
+competing NCAs on a fixed sine-derived environment tensor, using per-agent
+encoder/decoder competition instead of attack/defense cosine similarity.
 
 ## Setup 
 
@@ -14,8 +16,8 @@ uv sync
 
 ## Commands
 
-- basic: `uv run python src/train.py --n-ncas 3 --epochs 1000 --device cpu`
-- wandb logging: `uv run python src/train.py --n-ncas 3 --epochs 10000 --device cuda --wandb`
+- basic: `uv run python src/train.py --config configs/tiny-config.json`
+- wandb logging: `uv run python src/train.py --config configs/example.json --wandb`
 - run with config: `uv run python src/train.py --config configs/example.json`
 
 ## Configs

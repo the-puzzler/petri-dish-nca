@@ -1,13 +1,16 @@
 import argparse
 import datetime
+import json
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import wandb
 
 from config import Config
 from model import CASunGroup
-from viz import capture_snapshot, colors, generate_nca_colors
+from viz import capture_snapshot, colors, create_video, generate_nca_colors
 from world import World
 
 
@@ -92,6 +95,41 @@ def setup_experiment(
     return run, world, group, nca_colors
 
 
+def prepare_run_dir(run_name: str) -> Path:
+    run_dir = Path("runs") / run_name
+    (run_dir / "frames").mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def save_logged_frames(run_dir: Path, epoch: int, frames: list[torch.Tensor]) -> None:
+    if not frames:
+        return
+
+    frame_tensor = (torch.stack(frames).clamp(0, 1) * 255).to(torch.uint8)
+    frame_array = frame_tensor.permute(0, 2, 3, 1).cpu().numpy()
+    np.save(run_dir / "frames" / f"epoch_{epoch:06d}.npy", frame_array)
+    create_video(frame_array, output_path=str(run_dir / "frames" / f"epoch_{epoch:06d}.gif"), fps=4)
+
+
+def append_metrics(run_dir: Path, epoch: int, stats: dict[str, Any]) -> None:
+    metrics_path = run_dir / "metrics.jsonl"
+    payload = {"epoch": epoch, **stats}
+    with metrics_path.open("a") as f:
+        f.write(json.dumps(payload) + "\n")
+
+
+def save_run_summary(run_dir: Path, config: Config, last_stats: dict[str, Any] | None) -> None:
+    summary = {
+        "grid_size": list(config.grid_size),
+        "n_ncas": config.n_ncas,
+        "epochs": config.epochs,
+        "device": config.device,
+        "final_stats": last_stats,
+    }
+    with (run_dir / "summary.json").open("w") as f:
+        json.dump(summary, f, indent=2)
+
+
 def log_metrics(
     run: Any | None,
     epoch: int,
@@ -110,7 +148,7 @@ def log_metrics(
         nca_colors: Color mapping for each NCA.
         grid: Current grid state.
     """
-    avg_grad_norm = stats["grad_norm"].cpu().numpy().mean()
+    avg_grad_norm = float(stats["grad_norm"])
 
     if run:
         metrics = {"epoch": epoch}
@@ -123,6 +161,17 @@ def log_metrics(
         # Training metrics
         metrics["training/avg_grad_norm"] = avg_grad_norm
         metrics["training/loss"] = stats["loss"]
+        for i, mse in enumerate(stats.get("reconstruction_mse", [])):
+            metrics[f"training/reconstruction_mse_{i:02d}"] = mse
+        for i, row in enumerate(stats.get("cross_mse_matrix", [])):
+            for j, value in enumerate(row):
+                metrics[f"training/cross_mse_{i:02d}_{j:02d}"] = value
+        for i, row in enumerate(stats.get("territory_by_region", [])):
+            for j, value in enumerate(row):
+                metrics[f"territory/agent_{i:02d}_region_{j:02d}"] = value
+        for i, row in enumerate(stats.get("mse_by_region", [])):
+            for j, value in enumerate(row):
+                metrics[f"reconstruction/agent_{i:02d}_region_{j:02d}"] = value
 
         # Individual grad norms
         # for i, grad_norm in enumerate(stats["grad_norms"]):
@@ -147,8 +196,15 @@ def log_metrics(
     # Terminal logging
     growth_stats = [f"{g:.2f}" for g in stats["growth"]]
     growth_str = ", ".join(growth_stats)
+    mse_stats = ", ".join(f"{mse:.4f}" for mse in stats.get("reconstruction_mse", []))
+    region_winners = ", ".join(str(w) for w in stats.get("region_winners", []))
+    cross_matrix = stats.get("cross_mse_matrix", [])
+    cross_diag = ", ".join(
+        f"{row[i]:.4f}" for i, row in enumerate(cross_matrix) if i < len(row)
+    )
     print(
-        f"Epoch {epoch:6d} | Growth: [{growth_str}] | Grad: {avg_grad_norm:.3f} | Loss: {stats['loss']:.2f}"
+        f"Epoch {epoch:6d} | Growth: [{growth_str}] | Grad: {avg_grad_norm:.3f} | Loss: {stats['loss']:.2f} | "
+        f"MSE: [{mse_stats}] | SelfCross: [{cross_diag}] | Regions: [{region_winners}]"
     )
 
 
@@ -181,11 +237,13 @@ def train_loop(config: Config) -> None:
     run_name = (
         run.name if run else datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     )
+    run_dir = prepare_run_dir(run_name)
+    last_stats: dict[str, Any] | None = None
 
     try:
         for epoch in range(config.epochs + 1):
             # Initialize
-            grid = world.get_seed()
+            grid, env = world.get_seed()
 
             # Capture initial frame if logging
             frames = []
@@ -193,26 +251,31 @@ def train_loop(config: Config) -> None:
                 frames.append(capture_snapshot(grid, nca_colors))
 
             # Training step
-            stats, grid, grids = world.step(group, grid)
+            stats, grid, grids = world.step(group, grid, env)
+            last_stats = stats
 
             # Capture final frame and log if needed
             if should_log(epoch, config):
                 for st in range(grids.shape[0]):
                     frames.append(capture_snapshot(grids[st], nca_colors))
+                append_metrics(run_dir, epoch, stats)
+                save_logged_frames(run_dir, epoch, frames)
                 log_metrics(run, epoch, stats, frames, nca_colors, grid)
 
     except KeyboardInterrupt:
         print(f"\nTraining interrupted at epoch {epoch}")
-        group.save(config, run_name)
-        world.save(config, run_name)
+        group.save(config, str(run_dir))
+        world.save(config, str(run_dir))
+        save_run_summary(run_dir, config, last_stats)
         if run:
             wandb.finish()
         print("Saved model!")
 
     # Save model and world
     # TODO: Improve separate saves
-    group.save(config, run_name)
-    world.save(config, run_name)
+    group.save(config, str(run_dir))
+    world.save(config, str(run_dir))
+    save_run_summary(run_dir, config, last_stats)
 
     if run:
         wandb.finish()

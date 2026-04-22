@@ -7,59 +7,58 @@ import torch
 
 @dataclass
 class Config:
-    """Configuration class for adversarial NCA training experiments.
-
-    This dataclass manages all hyperparameters and system settings for training
-    competing Neural Cellular Automata. It includes automatic device detection,
-    validation, and seed management for reproducible experiments.
-    """
-
     # Grid
-    grid_size: tuple[int, int] = (10, 10)
+    grid_size: tuple[int, int] = (64, 64)
     n_seeds: int = 1
 
-    # World
-    cell_state_dim: int = 4
-    cell_hidden_dim: int = 4
+    # World state
+    cell_hidden_dim: int = 8
+    alive_visible: bool = True
+    alive_threshold: float = 0.4
 
-    # New world paradigm
+    # Fixed environment
+    env_kind: Literal["sine", "table"] = "sine"
+    env_dim: int = 4
+    sine_x_min: float = -3.141592653589793
+    sine_x_max: float = 3.141592653589793
+    data_assignment: Literal["x_axis", "tile", "random"] = "x_axis"
+    data_x_values: list[float] | None = None
+    data_y_values: list[float] | None = None
+    data_env_vectors: list[list[float]] | None = None
+
+    # Seeding
     seed_dist: Literal["scatter"] = "scatter"
-    # Whether it's set to 1 in everything or random noise
     seed_mode: Literal["solid", "random"] = "random"
-    alive_visible: bool = True  # Whether NCAs can see where things are alive
 
     # Burn-in config
-    # NOTE: For burn-in, we're currently updating both the steps_per_update and steps_before_update
     burn_in: bool = False
-    burn_in_increment_epochs: int = (
-        0  # How many steps before you try to increase the steps per
-    )
-    burn_in_increment: int = 0  # How many steps to increase by each time, it seems that
+    burn_in_increment_epochs: int = 0
+    burn_in_increment: int = 0
 
     # NCAs
-    n_ncas: int = 3
-    n_hidden_layers: int = 0
+    n_ncas: int = 6
+    n_hidden_layers: int = 1
     hidden_dim: int = 32
+    latent_dim: int = 4
+    decoder_hidden_dim: int = 16
     model_kernel_size: int = 3
     model_dropout_per: float = 0.0
-    per_hid_upd: float = 1.0  # Percentage of hidden channels each model can update
 
     # Training
     softmax_temp: float = 1.0
-    optimizer: Literal["AdamW", "Adam", "RMSProp", "SGD"] = "RMSProp"
+    reconstruction_loss_scale: float = 1.0
+    optimizer: Literal["AdamW", "Adam", "RMSProp", "SGD"] = "Adam"
     learning_rate: float = 3e-4
-    batch_size: int = 32
-    pool_size: int = 1024
+    batch_size: int = 8
+    pool_size: int = 64
     epochs: int = 1_000
     log_every: int = 100
     wandb: bool = False
 
-    # Sun
-    sun_update_epoch_wait: int = 0
-
     # Multi-world
     steps_before_update: int = 0
-    steps_per_update: int = 1
+    steps_per_update: int = 4
+    region_bins: int = 8
 
     # General system
     device: Literal["cpu", "cuda", "mps"] = "cuda"
@@ -67,22 +66,21 @@ class Config:
     mode: Literal["train", "eval", "frozen_eval"] = "train"
 
     def __post_init__(self) -> None:
-        """Validate configuration and initialize system settings.
-
-        Performs validation checks on configuration parameters, handles device
-        availability fallbacks, and sets random seeds for reproducibility.
-
-        Raises:
-            AssertionError: If cell_state_dim is not even or batch_size > pool_size.
-        """
-        assert self.cell_state_dim % 2 == 0, "[config] cell_state_dim must be even"
         assert self.batch_size <= self.pool_size, "[config] batch_size > pool_size"
         assert self.n_seeds * self.n_ncas <= self.total_grid_size, (
             "[config] n_seeds * n_ncas > self.total_grid_size"
         )
         assert self.softmax_temp > 0, "[config] softmax_temp <= 0"
+        assert self.region_bins > 0, "[config] region_bins must be positive"
+        if self.env_kind == "sine":
+            assert self.env_dim == 4, "[config] sine experiment expects env_dim == 4"
+        if self.env_kind == "table":
+            has_vectors = self.data_env_vectors is not None
+            has_xy = self.data_x_values is not None and self.data_y_values is not None
+            assert has_vectors or has_xy, (
+                "[config] table environment needs data_env_vectors or data_x_values/data_y_values"
+            )
 
-        # Device availability check
         if self.device == "cuda" and not torch.cuda.is_available():
             print("[warning] CUDA not available, falling back to CPU")
             object.__setattr__(self, "device", "cpu")
@@ -93,11 +91,9 @@ class Config:
         self._set_random_seed()
 
     def _set_random_seed(self) -> None:
-        """Set all random seeds for reproducibility"""
         import random
 
         import numpy as np
-        import torch
 
         random.seed(self.seed)
         np.random.seed(self.seed)
@@ -111,71 +107,44 @@ class Config:
         torch.backends.cudnn.benchmark = False
 
     @property
-    def cell_dim(self) -> int:
-        """Total cell dimension including state, hidden, aliveness, and NCA channels.
-
-        Returns:
-            Combined dimension of cell_state_dim + cell_hidden_dim + n_ncas + 1.
-        """
-        return self.cell_state_dim + self.cell_hidden_dim + self.n_ncas + 1
-
-    @property
-    def cell_wo_alive_dim(self) -> int:
-        """Cell dimension w/o NCA channels (just state and hidden)
-
-        Returns:
-            Combined dimension of cell_state_dim + cell_hidden_dim
-        """
-        return self.cell_state_dim + self.cell_hidden_dim
-
-    @property
     def alive_dim(self) -> int:
-        """Dimension for aliveness channels.
-
-        Returns:
-            Number of aliveness channels (n_ncas + 1 for sun).
-        """
         return self.n_ncas + 1
 
     @property
-    def total_grid_size(self) -> int:
-        """Total number of cells in the grid.
+    def agent_state_dim(self) -> int:
+        return self.latent_dim + self.env_dim + self.cell_hidden_dim
 
-        Returns:
-            Product of grid dimensions (width * height).
-        """
+    @property
+    def cell_dim(self) -> int:
+        return self.alive_dim + self.n_ncas * self.agent_state_dim
+
+    def agent_state_offset(self, agent_idx: int) -> int:
+        return self.alive_dim + agent_idx * self.agent_state_dim
+
+    def agent_a_slice(self, agent_idx: int) -> slice:
+        start = self.agent_state_offset(agent_idx)
+        end = start + self.latent_dim
+        return slice(start, end)
+
+    def agent_d_slice(self, agent_idx: int) -> slice:
+        start = self.agent_state_offset(agent_idx) + self.latent_dim
+        end = start + self.env_dim
+        return slice(start, end)
+
+    def agent_h_slice(self, agent_idx: int) -> slice:
+        start = self.agent_state_offset(agent_idx) + self.latent_dim + self.env_dim
+        end = start + self.cell_hidden_dim
+        return slice(start, end)
+
+    @property
+    def total_grid_size(self) -> int:
         return self.grid_size[0] * self.grid_size[1]
 
     @classmethod
     def from_file(cls, path: str) -> "Config":
-        """Load configuration from JSON file.
-
-        Args:
-            path: Path to JSON configuration file.
-
-        Returns:
-            Config instance with parameters loaded from file.
-
-        Raises:
-            FileNotFoundError: If the config file doesn't exist.
-            json.JSONDecodeError: If the file contains invalid JSON.
-        """
         with open(path) as f:
             return cls(**json.load(f))
 
     def save(self, path: str) -> None:
-        """Save configuration to JSON file.
-
-        Args:
-            path: Output path for JSON configuration file.
-
-        Raises:
-            IOError: If the file cannot be written.
-        """
-        for key, value in self.__dict__.items():
-            if isinstance(value, torch.Tensor):
-                print(f"Found tensor in {key}: {value}")
-            elif isinstance(value, torch.device):
-                print(f"Found torch.device in {key}: {value}")
         with open(path, "w") as f:
             json.dump(self.__dict__, f, indent=4)
